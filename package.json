@@ -1,7 +1,7 @@
 {
-  "name": "koishi-plugin-comfyui-client",
+  "name": "koishi-plugin-comfyclient",
   "description": "一个Koishi适用的ComfyUI客户端插件",
-  "version": "1.0.0",
+  "version": "0.0.1",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [

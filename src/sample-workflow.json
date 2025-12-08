@@ -1,26 +1,26 @@
 {
   "3": {
     "inputs": {
-      "seed": 812320824129823,
-      "steps": 20,
-      "cfg": 4,
-      "sampler_name": "euler",
-      "scheduler": "beta57",
+      "seed": 416086462539788,
+      "steps": 28,
+      "cfg": 5,
+      "sampler_name": "res_multistep",
+      "scheduler": "linear_quadratic",
       "denoise": 1,
       "model": [
-        "16",
+        "38",
         0
       ],
       "positive": [
-        "6",
+        "28",
         0
       ],
       "negative": [
-        "7",
+        "29",
         0
       ],
       "latent_image": [
-        "12",
+        "9",
         0
       ]
     },
@@ -29,40 +29,14 @@
       "title": "K采样器"
     }
   },
-  "6": {
-    "inputs": {
-      "text": "114514.1919810",
-      "clip": [
-        "10",
-        0
-      ]
-    },
-    "class_type": "CLIPTextEncode",
-    "_meta": {
-      "title": "CLIP文本编码"
-    }
-  },
-  "7": {
-    "inputs": {
-      "text": "low quality, bad anatomy, extra digits, missing digits, extra limbs, missing limbs",
-      "clip": [
-        "10",
-        0
-      ]
-    },
-    "class_type": "CLIPTextEncode",
-    "_meta": {
-      "title": "CLIP文本编码"
-    }
-  },
-  "8": {
+  "4": {
     "inputs": {
       "samples": [
         "3",
         0
       ],
       "vae": [
-        "15",
+        "5",
         0
       ]
     },
@@ -71,34 +45,19 @@
       "title": "VAE解码"
     }
   },
+  "5": {
+    "inputs": {
+      "vae_name": "diffusion_pytorch_model.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "加载VAE"
+    }
+  },
   "9": {
     "inputs": {
-      "filename_prefix": "ComfyUI",
-      "images": [
-        "8",
-        0
-      ]
-    },
-    "class_type": "SaveImage",
-    "_meta": {
-      "title": "保存图像"
-    }
-  },
-  "10": {
-    "inputs": {
-      "clip_name": "text_encoders/t5xxl_fp8_e4m3fn_scaled.safetensors",
-      "type": "chroma",
-      "device": "default"
-    },
-    "class_type": "CLIPLoader",
-    "_meta": {
-      "title": "加载CLIP"
-    }
-  },
-  "12": {
-    "inputs": {
-      "width": 1024,
-      "height": 1024,
+      "width": 832,
+      "height": 1216,
       "batch_size": 1
     },
     "class_type": "EmptySD3LatentImage",
@@ -106,38 +65,101 @@
       "title": "空Latent图像（SD3）"
     }
   },
-  "13": {
+  "17": {
     "inputs": {
-      "unet_name": "chroma-unlocked-v50.safetensors",
-      "weight_dtype": "default"
+      "gemma_model_path": "E:\\\\AI\\\\newbie\\\\ComfyUI-Newbie-V0.1\\\\models\\\\gemma3",
+      "jina_clip_path": "E:\\\\AI\\\\newbie\\\\ComfyUI-Newbie-V0.1\\\\models\\\\jina_clip\\\\",
+      "device": "cuda",
+      "dtype": "bf16",
+      "cpu_offload": false,
+      "enable_jina_weights": true,
+      "weight_baseline_mode": "mean",
+      "weight_strength": 1,
+      "mask_normalization": true
     },
-    "class_type": "UNETLoader",
+    "class_type": "NewBieCLIPLoader",
     "_meta": {
-      "title": "UNet加载器"
+      "title": "NewBie CLIP Loader"
     }
   },
-  "15": {
+  "26": {
     "inputs": {
-      "vae_name": "ae.safetensors"
+      "model_name": "diffusion_pytorch_model.safetensors",
+      "weight_dtype": "bf16",
+      "compute_dtype": "default",
+      "patch_cublaslinear": false,
+      "sage_attention": "disabled",
+      "enable_fp16_accumulation": true
     },
-    "class_type": "VAELoader",
+    "class_type": "DiffusionModelLoaderKJ",
     "_meta": {
-      "title": "加载VAE"
+      "title": "Diffusion Model Loader KJ"
     }
   },
-  "16": {
+  "28": {
     "inputs": {
-      "scale_low": 1,
-      "scale_high": 2.5000000000000004,
-      "freq_cutoff": 30,
-      "model": [
-        "13",
+      "user_prompt": "{{prompt}}",
+      "system_prompt": "You are an assistant designed to generate high-quality anime images with the highest degree of image-text alignment based on xml format textual prompts. <Prompt Start>",
+      "use_chat_template": {
+        "__value__": [
+          false,
+          true
+        ]
+      },
+      "clip": [
+        "17",
         0
       ]
     },
-    "class_type": "FreSca",
+    "class_type": "NewBieCLIPTextEncode",
     "_meta": {
-      "title": "FreSca"
+      "title": "NewBie CLIP Text Encode"
+    }
+  },
+  "29": {
+    "inputs": {
+      "user_prompt": "text, nsfw, lowres, artistic error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, dithering, halftone, screentone, multiple views, logo, too many watermarks, negative space, blank page, nsfw, lowres, bad, error, fewer, extra, missing, worst quality, jpeg artifacts, bad quality, watermark, unfinished, displeasing, chromatic aberration, signature, extra digits, artistic error, username, scan, face,eyes,contrast,wlop watermark",
+      "system_prompt": "You are an assistant designed to generate high-quality anime images with the highest degree of image-text alignment based on textual prompts. <Prompt Start> ",
+      "use_chat_template": {
+        "__value__": [
+          false,
+          true
+        ]
+      },
+      "clip": [
+        "17",
+        0
+      ]
+    },
+    "class_type": "NewBieCLIPTextEncode",
+    "_meta": {
+      "title": "NewBie CLIP Text Encode"
+    }
+  },
+  "38": {
+    "inputs": {
+      "shift": 6,
+      "model": [
+        "26",
+        0
+      ]
+    },
+    "class_type": "ModelSamplingNewbie",
+    "_meta": {
+      "title": "Model Sampling (Newbie)"
+    }
+  },
+  "53": {
+    "inputs": {
+      "filename_prefix": "newbie",
+      "images": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "保存图像"
     }
   }
 }

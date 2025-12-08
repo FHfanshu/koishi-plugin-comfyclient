@@ -1,6 +1,9 @@
 import FormData from 'form-data';
 import WebSocket from 'ws';
 import { v4 as uuidv4 } from 'uuid';
+import { Logger } from 'koishi';
+
+const PROMPT_PLACEHOLDER = '{{prompt}}';
 
 export class ComfyUINode {
   serverEndpoint: any;
@@ -8,13 +11,26 @@ export class ComfyUINode {
   clientId: any;
   ws: any;
   ctx: any;
-  constructor(ctx: any, serverEndpoint: any, isSecureConnection: boolean = false, clientId: any = null) {
+  logger?: Logger;
+  logEnabled: boolean;
+
+  constructor(ctx: any, serverEndpoint: any, isSecureConnection: boolean = false, logger?: Logger, logEnabled: boolean = true, clientId: any = null) {
     this.ctx = ctx;
     this.serverEndpoint = serverEndpoint;
     this.isSecureConnection = isSecureConnection;
     this.clientId = clientId || uuidv4();
     this.ws = null;
+    this.logger = logger;
+    this.logEnabled = logEnabled;
   }
+
+  private log(level: 'debug' | 'info' | 'warn' | 'error', message: string, meta?: Record<string, any>) {
+    if (!this.logEnabled || !this.logger) return;
+    const safeMeta = meta ? JSON.stringify(meta) : '';
+    // Koishi logger methods mirror standard console levels
+    (this.logger as any)[level]?.(safeMeta ? `${message} ${safeMeta}` : message);
+  }
+
   /**
    * 用户上传图片，返回服务器的响应值
    * @param {Buffer|ArrayBuffer} imageBuffer - 图片数据
@@ -34,12 +50,14 @@ export class ComfyUINode {
         },
       });
 
+      this.log('info', '上传图片到 ComfyUI 成功', { filename, overwrite });
       return {
         success: true,
         data: response,
         message: 'Image uploaded successfully'
       };
     } catch (error) {
+      this.log('error', '上传图片到 ComfyUI 失败', { filename, error: error.message });
       return {
         success: false,
         error: error.response?.data || error.message,
@@ -64,14 +82,17 @@ export class ComfyUINode {
       });
 
       this.ws.on('open', () => {
+        this.log('info', 'WebSocket 连接已建立', { url });
         resolve();
       });
 
       this.ws.on('close', () => {
+        this.log('warn', 'WebSocket 连接已关闭');
         this.ws = null;
       });
 
       this.ws.on('error', (err) => {
+        this.log('error', 'WebSocket 连接错误', { error: err.message });
         reject(err);
       });
 
@@ -104,11 +125,14 @@ export class ComfyUINode {
         break;
       case 'executing':
         if (message.data.node) {
+          this.log('debug', '工作流节点执行中', { node: message.data.node, promptId: message.data.prompt_id });
         }
         break;
       case 'execution_start':
+        this.log('info', '工作流开始执行', { promptId: message.data?.prompt_id });
         break;
       case 'executed':
+        this.log('info', '工作流节点执行完成', { node: message.data?.node });
         break;
       default:
         break;
@@ -121,6 +145,7 @@ export class ComfyUINode {
    */
   async disconnect() {
     if (this.ws) {
+      this.log('info', '主动断开 WebSocket 连接');
       this.ws.close();
       this.ws = null;
     }
@@ -142,6 +167,7 @@ export class ComfyUINode {
           'Content-Type': 'application/json'
         }
       });
+      this.log('info', '提交工作流到队列成功', { promptId: response.prompt_id, number: response.number });
       return {
         success: true,
         data: response,
@@ -149,6 +175,7 @@ export class ComfyUINode {
         number: response.number
       };
     } catch (error) {
+      this.log('error', '提交工作流到队列失败', { error: error.response?.data || error.message });
       return {
         success: false,
         error: error.response?.data || error.message,
@@ -170,11 +197,13 @@ export class ComfyUINode {
 
       const response = await this.ctx.http.get(url);
 
+      this.log('debug', '获取历史记录', { promptId });
       return {
         success: true,
         data: promptId ? response[promptId] : response
       };
     } catch (error) {
+      this.log('error', '获取历史记录失败', { promptId, error: error.response?.data || error.message });
       return {
         success: false,
         error: error.response?.data || error.message,
@@ -195,12 +224,14 @@ export class ComfyUINode {
       const url = `${this.isSecureConnection ? 'https' : 'http'}://${this.serverEndpoint}/view?filename=${filename}&subfolder=${subfolder}&type=${type}`;
       const response = await this.ctx.http.get(url, { responseType: 'arraybuffer' });
 
+      this.log('info', '获取生成图片成功', { filename, subfolder, type });
       return {
         success: true,
         data: response,
         buffer: Buffer.from(response)
       };
     } catch (error) {
+      this.log('error', '获取生成图片失败', { filename, subfolder, error: error.response?.data || error.message });
       return {
         success: false,
         error: error.response?.data || error.message,
@@ -279,6 +310,7 @@ export class ComfyUINode {
               }
             }
 
+            this.log('info', '工作流执行完成', { promptId });
             resolve({
               success: true,
               prompt_id: promptId,
@@ -347,7 +379,11 @@ export class ComfyUINode {
 
       // 0. 修改prompt
       const newSeedPrompt = this._modifyPromptToAvoidCache(workflowJson, avoidCache);
-      const finalPrompt = JSON.parse(JSON.stringify(newSeedPrompt).replace("114514.1919810", userPrompt))
+      const promptString = JSON.stringify(newSeedPrompt);
+      if (!promptString.includes(PROMPT_PLACEHOLDER)) {
+        this.log('warn', '工作流中未找到提示词占位符，将使用原始JSON', { placeholder: PROMPT_PLACEHOLDER });
+      }
+      const finalPrompt = JSON.parse(promptString.replaceAll(PROMPT_PLACEHOLDER, userPrompt))
       // 1. 建立WebSocket连接
       await this.connect();
       // 2. 提交prompt到队列
@@ -357,6 +393,7 @@ export class ComfyUINode {
         return queueResult;
       }
 
+      this.log('info', '等待工作流执行', { promptId: queueResult.prompt_id });
       // 3. 等待执行完成
       const executionResult = await this.waitForCompletion(queueResult.prompt_id);
 
@@ -369,6 +406,7 @@ export class ComfyUINode {
       // 确保断开连接
       await this.disconnect();
 
+      this.log('error', '执行工作流失败', { error: error.message });
       return {
         success: false,
         error: error.message,
@@ -390,12 +428,14 @@ export class ComfyUINode {
         }
       });
 
+      this.log('warn', '中断执行成功');
       return {
         success: true,
         data: response,
         message: 'Execution interrupted successfully'
       };
     } catch (error) {
+      this.log('error', '中断执行失败', { error: error.response?.data || error.message });
       return {
         success: false,
         error: error.response?.data || error.message,
@@ -412,12 +452,14 @@ export class ComfyUINode {
     try {
       const response = await this.ctx.http.get(`${this.isSecureConnection ? 'https' : 'http'}://${this.serverEndpoint}/queue`);
 
+      this.log('debug', '获取队列状态成功');
       return {
         success: true,
         data: response,
         message: 'Queue status retrieved successfully'
       };
     } catch (error) {
+      this.log('error', '获取队列状态失败', { error: error.response?.data || error.message });
       return {
         success: false,
         error: error.response?.data || error.message,
