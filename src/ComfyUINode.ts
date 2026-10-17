@@ -1,9 +1,12 @@
 import FormData from 'form-data';
-import WebSocket from 'ws';
+import WebSocket, { RawData } from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 import { Logger } from 'koishi';
 
 const PROMPT_PLACEHOLDER = '{{prompt}}';
+type PlaceholderDict = Record<string, string | number | boolean>;
+
+const escapeRegExp = (input: string) => input.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 export class ComfyUINode {
   serverEndpoint: any;
@@ -13,8 +16,24 @@ export class ComfyUINode {
   ctx: any;
   logger?: Logger;
   logEnabled: boolean;
+  debugEnabled: boolean;
+  httpProxy?: string;
+  accessPassword?: string;
+  insecureTLS?: boolean;
+  private envProxySnapshot: Record<string, string | undefined>;
 
-  constructor(ctx: any, serverEndpoint: any, isSecureConnection: boolean = false, logger?: Logger, logEnabled: boolean = true, clientId: any = null) {
+  constructor(
+    ctx: any,
+    serverEndpoint: any,
+    isSecureConnection: boolean = false,
+    logger?: Logger,
+    logEnabled: boolean = true,
+    debugEnabled: boolean = false,
+    clientId: any = null,
+    httpProxy?: string,
+    accessPassword?: string,
+    insecureTLS: boolean = false
+  ) {
     this.ctx = ctx;
     this.serverEndpoint = serverEndpoint;
     this.isSecureConnection = isSecureConnection;
@@ -22,45 +41,219 @@ export class ComfyUINode {
     this.ws = null;
     this.logger = logger;
     this.logEnabled = logEnabled;
+    this.debugEnabled = debugEnabled;
+    this.accessPassword = accessPassword;
+    this.insecureTLS = insecureTLS;
+    this.httpProxy = httpProxy;
+    this.envProxySnapshot = this.captureEnvProxy();
+  }
+
+  private sleep(ms: number) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  private captureEnvProxy() {
+    // 记录启动时的代理环境变量，便于日志观察
+    return {
+      http_proxy: process.env.http_proxy || process.env.HTTP_PROXY,
+      https_proxy: process.env.https_proxy || process.env.HTTPS_PROXY,
+      all_proxy: process.env.all_proxy || process.env.ALL_PROXY,
+      no_proxy: process.env.no_proxy || process.env.NO_PROXY,
+    };
+  }
+
+  private parseProxy(urlStr?: string) {
+    if (!urlStr) return null;
+    try {
+      const u = new URL(urlStr);
+      if (!u.port) return null;
+      return {
+        protocol: u.protocol?.replace(':', ''),
+        host: u.hostname,
+        port: u.port ? Number(u.port) : undefined,
+        auth: u.username ? { username: u.username, password: u.password || '' } : undefined,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private isRetryableError(error: any) {
+    const status = error?.response?.status;
+    const code = error?.code || error?.cause?.code;
+    const message: string = error?.message || '';
+
+    const retryableStatus = [408, 425, 429, 500, 502, 503, 504];
+    const retryableCodes = ['ECONNRESET', 'ECONNREFUSED', 'EAI_AGAIN', 'ETIMEDOUT'];
+
+    if (status && retryableStatus.includes(status)) return true;
+    if (code && retryableCodes.includes(code)) return true;
+    if (/timeout/i.test(message) || /network/i.test(message) || /fetch failed/i.test(message)) return true;
+    return false;
+  }
+
+  private async withRetry<T>(action: string, fn: () => Promise<T>, maxAttempts = 3, baseDelay = 400): Promise<T> {
+    let lastError: any;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        if (attempt > 1) {
+          this.log('warn', `${action}失败，正在重试`, { attempt, maxAttempts });
+        }
+        return await fn();
+      } catch (error) {
+        lastError = error;
+        const canRetry = this.isRetryableError(error) && attempt < maxAttempts;
+        this.log(canRetry ? 'warn' : 'error', `${action}出错`, {
+          attempt,
+          maxAttempts,
+          error: error?.message || error
+        });
+        if (!canRetry) break;
+        const delay = baseDelay * Math.pow(2, attempt - 1);
+        await this.sleep(delay);
+      }
+    }
+
+    throw lastError;
   }
 
   private log(level: 'debug' | 'info' | 'warn' | 'error', message: string, meta?: Record<string, any>) {
-    if (!this.logEnabled || !this.logger) return;
+    if (!this.logEnabled) return;
     const safeMeta = meta ? JSON.stringify(meta) : '';
-    // Koishi logger methods mirror standard console levels
-    (this.logger as any)[level]?.(safeMeta ? `${message} ${safeMeta}` : message);
+    const text = safeMeta ? `${message} ${safeMeta}` : message;
+
+    // 1) 调用 Koishi logger（可能被等级过滤）
+    if (this.logger) {
+      if (level !== 'debug' || this.debugEnabled) {
+        (this.logger as any)[level]?.(text);
+      }
+      // debug 开启时，用 info 再打印一份保证可见
+      if (level === 'debug' && this.debugEnabled) {
+        (this.logger as any)['info']?.(`[debug] ${text}`);
+      }
+    }
+
+    // 2) 直接输出 stdout，绕过 Koishi 等级过滤（仅 debug 时启用）
+    if (level === 'debug' && this.debugEnabled) {
+      const prefix = '[comfyui-client][debug]';
+      console.log(`${prefix} ${text}`);
+    }
   }
 
   /**
    * 用户上传图片，返回服务器的响应值
    * @param {Buffer|ArrayBuffer} imageBuffer - 图片数据
-   * @param {string} filename - 文件名
+   * @param {string} filename - 文件名（需要包含扩展名，否则 ComfyUI 可能报错）
    * @param {boolean} overwrite - 是否覆盖已存在的文件，默认true
+   * @param {object} options - 额外上传配置
+   * @param {number} options.timeoutMs - 单次请求超时时间，默认120000ms
+   * @param {number} options.maxAttempts - 最大重试次数，默认3
    * @returns {Promise<Object>} 服务器响应，包含success、data和message
    */
-  async uploadImage(imageBuffer, filename, overwrite = true) {
+  async uploadImage(
+    imageBuffer,
+    filename,
+    overwrite = true,
+    options: { timeoutMs?: number; maxAttempts?: number } = {}
+  ) {
+    const { timeoutMs = 120000, maxAttempts = 3 } = options;
     try {
-      const formData = new FormData();
-      formData.append('image', imageBuffer, filename);
-      formData.append('overwrite', overwrite.toString());
+      await this.ensureAccessAuth();
+      const buildForm = () => {
+        const formData = new FormData();
+        formData.append('image', imageBuffer, filename);
+        formData.append('overwrite', overwrite.toString());
+        return formData;
+      };
 
-      const response = await this.ctx.http.post(`${this.isSecureConnection ? 'https' : 'http'}://${this.serverEndpoint}/upload/image`, formData, {
-        headers: {
-          ...formData.getHeaders(),
-        },
-      });
+      const resolveProxy = () => {
+        // 1) 配置优先
+        const fromConfig = this.parseProxy(this.httpProxy?.trim());
+        if (fromConfig) return { proxy: fromConfig, source: 'config' };
 
-      this.log('info', '上传图片到 ComfyUI 成功', { filename, overwrite });
+        // 2) 环境变量兜底（优先 http_proxy/https_proxy，其次 all_proxy）
+        const envCandidate = this.envProxySnapshot.http_proxy || this.envProxySnapshot.https_proxy || this.envProxySnapshot.all_proxy;
+        const fromEnv = this.parseProxy(envCandidate);
+        if (fromEnv) return { proxy: fromEnv, source: 'env' };
+
+        return { proxy: undefined, source: 'direct' }; // 无代理
+      };
+
+      const sendOnce = async (attempt: number) => {
+        const formData = buildForm();
+
+        const getContentLength = () =>
+          new Promise<number | undefined>((resolve) => {
+            formData.getLength((err, length) => {
+              if (err) {
+                this.log('warn', '计算 Content-Length 失败，改用 chunked 传输', { attempt, error: err?.message || err });
+                resolve(undefined);
+              } else {
+                resolve(length);
+              }
+            });
+          });
+
+        const contentLength = await getContentLength();
+
+        const { proxy, source: proxySource } = resolveProxy();
+        this.log('debug', '开始上传图片到 ComfyUI', {
+          attempt,
+          filename,
+          contentLength,
+          proxy: proxy ? `${proxy.host}:${proxy.port || ''}` : proxySource,
+          envProxy: proxySource !== 'config' ? this.envProxySnapshot : undefined,
+        });
+
+        const url = `${this.isSecureConnection ? 'https' : 'http'}://${this.serverEndpoint}/upload/image`;
+        const started = Date.now();
+        const response = await this.ctx.http.post(url, formData as any, {
+          headers: {
+            ...formData.getHeaders(),
+            ...(typeof contentLength === 'number' ? { 'Content-Length': contentLength } : {}),
+          },
+          maxContentLength: Infinity,
+          maxBodyLength: Infinity,
+          timeout: timeoutMs,
+          proxy,
+        });
+
+        const costMs = Date.now() - started;
+        const respAny: any = response;
+        this.log('debug', '上传图片 HTTP 返回', {
+          attempt,
+          status: respAny?.status ?? 'n/a',
+          elapsedMs: costMs,
+          contentType: respAny?.headers?.['content-type'],
+          payloadKeys: respAny?.data ? Object.keys(respAny.data).slice(0, 5) : [],
+        });
+
+        return response;
+      };
+
+      let attemptCounter = 0;
+      const response = await this.withRetry('上传图片到 ComfyUI', () => {
+        attemptCounter += 1;
+        return sendOnce(attemptCounter);
+      }, maxAttempts);
+
+      const payload = (response as any)?.data ?? response;
+      this.log('info', '上传图片到 ComfyUI 成功', { filename, overwrite, payload });
       return {
         success: true,
-        data: response,
+        data: payload,
         message: 'Image uploaded successfully'
       };
     } catch (error) {
-      this.log('error', '上传图片到 ComfyUI 失败', { filename, error: error.message });
+      const status = (error as any)?.response?.status;
+      const body = (error as any)?.response?.data;
+      const detail = body || (error as any)?.message || error;
+      const bodyPreview = typeof body === 'string' ? body.slice(0, 500) : undefined;
+      this.log('error', '上传图片到 ComfyUI 失败', { filename, status, error: detail, bodyPreview });
       return {
         success: false,
-        error: error.response?.data || error.message,
+        error: detail,
         message: 'Failed to upload image'
       };
     }
@@ -70,43 +263,99 @@ export class ComfyUINode {
    * 建立WebSocket连接
    * @returns {Promise<void>}
    */
-  async connect() {
-    return new Promise<void>((resolve, reject) => {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        resolve();
-        return;
+  /**
+   * SakuraFrp 等 frp 服务的「访问密码」是按来源 IP 放行一段时间的表单认证：
+   * GET 会返回登录页（HTML），把页面里的 csrf / ip 连同密码 POST 回去即可放行。
+   * 已放行时 GET 直接返回 JSON，这里就什么也不做。
+   */
+  private async ensureAccessAuth() {
+    if (!this.accessPassword) return;
+    const base = `${this.isSecureConnection ? 'https' : 'http'}://${this.serverEndpoint}`;
+    const doFetch = (globalThis as any).fetch;
+    if (typeof doFetch !== 'function') return;
+
+    try {
+      const probe = await doFetch(`${base}/system_stats`, { redirect: 'manual' });
+      const text = await probe.text();
+      if (text.trimStart().startsWith('{')) return;
+
+      const csrf = /name="csrf" value="([^"]*)"/.exec(text)?.[1] || '';
+      const ip = /name="ip" value="([^"]*)"/.exec(text)?.[1] || '';
+      const body = new URLSearchParams({ pw: this.accessPassword, persist_auth: 'on', csrf, ip });
+      const res = await doFetch(`${base}/system_stats`, { method: 'POST', body, redirect: 'manual' });
+      this.log('info', '已提交 frp 访问密码', { status: res.status, csrf, ip });
+
+      const after = await doFetch(`${base}/system_stats`, { redirect: 'manual' });
+      const afterText = await after.text();
+      if (!afterText.trimStart().startsWith('{')) {
+        this.log('warn', '访问密码未放行，仍返回非 JSON', { status: after.status });
       }
-      const url = `${this.isSecureConnection ? 'wss' : 'ws'}://${this.serverEndpoint}/ws?clientId=${this.clientId}`;
-      this.ws = new WebSocket(url, {
-        perMessageDeflate: false,
-      });
+    } catch (error) {
+      this.log('warn', '提交 frp 访问密码失败', { error: (error as any)?.message || error });
+    }
+  }
 
-      this.ws.on('open', () => {
-        this.log('info', 'WebSocket 连接已建立', { url });
-        resolve();
-      });
+  async connect(maxAttempts = 3) {
+    const url = `${this.isSecureConnection ? 'wss' : 'ws'}://${this.serverEndpoint}/ws?clientId=${this.clientId}`;
 
-      this.ws.on('close', () => {
-        this.log('warn', 'WebSocket 连接已关闭');
-        this.ws = null;
-      });
-
-      this.ws.on('error', (err) => {
-        this.log('error', 'WebSocket 连接错误', { error: err.message });
-        reject(err);
-      });
-
-      this.ws.on('message', (data, isBinary) => {
-        if (!isBinary) {
-          try {
-            const message = JSON.parse(data.toString());
-            this._handleWebSocketMessage(message);
-          } catch (err) {
-            console.error('Failed to parse WebSocket message:', err);
-          }
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          return;
         }
-      });
-    });
+
+        await new Promise<void>((resolve, reject) => {
+          this.ws = new WebSocket(url, { perMessageDeflate: false, rejectUnauthorized: !this.insecureTLS });
+
+          const handleError = (err) => {
+            this.log('error', 'WebSocket 连接错误', { attempt, error: err.message });
+            this.ws?.terminate?.();
+            cleanup();
+            reject(err);
+          };
+
+          const handleOpen = () => {
+            this.log('info', 'WebSocket 连接已建立', { url, attempt });
+            cleanup();
+            resolve();
+          };
+
+          const handleClose = () => {
+            this.log('warn', 'WebSocket 连接已关闭');
+            this.ws = null;
+          };
+
+          const handleMessage = (data, isBinary) => {
+            if (!isBinary) {
+              try {
+                const message = JSON.parse(data.toString());
+                this._handleWebSocketMessage(message);
+              } catch (err) {
+                this.log('warn', '解析 WebSocket 消息失败', { error: err.message });
+              }
+            }
+          };
+
+          const cleanup = () => {
+            this.ws?.off('open', handleOpen);
+            this.ws?.off('error', handleError);
+            this.ws?.off('close', handleClose);
+            this.ws?.off('message', handleMessage);
+          };
+
+          this.ws.on('open', handleOpen);
+          this.ws.on('error', handleError);
+          this.ws.on('close', handleClose);
+          this.ws.on('message', handleMessage);
+        });
+
+        return;
+      } catch (error) {
+        if (attempt === maxAttempts) throw error;
+        const backoff = 300 * Math.pow(2, attempt - 1);
+        await this.sleep(backoff);
+      }
+    }
   }
 
   /**
@@ -158,15 +407,16 @@ export class ComfyUINode {
    */
   async queuePrompt(prompt) {
     try {
-      const response = await this.ctx.http.post(`${this.isSecureConnection ? 'https' : 'http'}://${this.serverEndpoint}/prompt`, {
+      const response = await this.withRetry<any>('提交工作流到队列', () => this.ctx.http.post(`${this.isSecureConnection ? 'https' : 'http'}://${this.serverEndpoint}/prompt`, {
         prompt,
         client_id: this.clientId
       }, {
         headers: {
           'Accept': 'application/json',
           'Content-Type': 'application/json'
-        }
-      });
+        },
+        proxy: undefined, // 避免因手动代理配置影响提示提交；遵循环境变量
+      }));
       this.log('info', '提交工作流到队列成功', { promptId: response.prompt_id, number: response.number });
       return {
         success: true,
@@ -193,9 +443,9 @@ export class ComfyUINode {
     try {
       const url = promptId ?
         `${this.isSecureConnection ? 'https' : 'http'}://${this.serverEndpoint}/history/${promptId}` :
-        `${this.isSecureConnection ? 'https' : 'http'}://${this.serverEndpoint}/history`;
+        `${this.isSecureConnection ? 'https' : 'http'}://${this.serverEndpoint}/history`; 
 
-      const response = await this.ctx.http.get(url);
+      const response = await this.withRetry<any>('获取历史记录', () => this.ctx.http.get(url));
 
       this.log('debug', '获取历史记录', { promptId });
       return {
@@ -222,13 +472,14 @@ export class ComfyUINode {
   async getImage(filename, subfolder = '', type = 'output') {
     try {
       const url = `${this.isSecureConnection ? 'https' : 'http'}://${this.serverEndpoint}/view?filename=${filename}&subfolder=${subfolder}&type=${type}`;
-      const response = await this.ctx.http.get(url, { responseType: 'arraybuffer' });
+      const response = await this.withRetry<ArrayBuffer>('获取生成图片', () => this.ctx.http.get(url, { responseType: 'arraybuffer' }));
 
       this.log('info', '获取生成图片成功', { filename, subfolder, type });
+      const imageBuffer = Buffer.from(response as ArrayBuffer);
       return {
         success: true,
         data: response,
-        buffer: Buffer.from(response)
+        buffer: imageBuffer
       };
     } catch (error) {
       this.log('error', '获取生成图片失败', { filename, subfolder, error: error.response?.data || error.message });
@@ -257,29 +508,60 @@ export class ComfyUINode {
         reject(new Error('Execution timeout'));
       }, 300000); // 5分钟超时
 
-      const onMessage = async (data, isBinary) => {
+      const onClose = () => {
+        clearTimeout(timeout);
+        this.ws?.off('message', onMessage);
+        this.ws?.off('close', onClose);
+        reject(new Error('WebSocket closed before completion'));
+      };
+
+      const onMessage = async (data: RawData, isBinary: boolean) => {
         if (isBinary) return;
 
         try {
-          const message = JSON.parse(data.toString());
+          const textPayload = (() => {
+            if (typeof data === 'string') return data;
+            if (Array.isArray(data)) return Buffer.concat(data).toString();
+            return Buffer.from(data as ArrayBuffer).toString();
+          })();
+
+          const message = JSON.parse(textPayload);
           const messageData = message.data;
 
           // 检查是否是我们等待的prompt完成消息
-          if (message.type === 'executing' &&
-            messageData.prompt_id === promptId &&
-            messageData.node === null) {
+            if (message.type === 'executing' &&
+              messageData.prompt_id === promptId &&
+              messageData.node === null) {
 
             clearTimeout(timeout);
             this.ws?.off('message', onMessage);
+            this.ws?.off('close', onClose);
 
-            // 获取执行历史和结果
-            const historyResult = await this.getHistory(promptId);
-            if (!historyResult.success) {
+            // 获取执行历史和结果（容错重试，避免写盘延迟导致 outputs 为空）
+            const fetchHistoryWithRetry = async () => {
+              const attempts = 10;
+              const delay = 500;
+              let last: any;
+              for (let i = 1; i <= attempts; i++) {
+                last = await this.getHistory(promptId);
+                const hasOutputs = last?.success && last.data && Object.keys(last.data.outputs || {}).length > 0;
+                if (hasOutputs) {
+                  this.log('info', '获取执行历史成功', { attempt: i, promptId });
+                  return last;
+                }
+                this.log('debug', '执行历史尚无输出，等待重试', { attempt: i, promptId });
+                if (i < attempts) await this.sleep(delay);
+              }
+              return last;
+            };
+
+            const historyResult = await fetchHistoryWithRetry();
+            if (!historyResult?.success) {
               reject(new Error('Failed to get execution history'));
               return;
             }
 
-            const history = historyResult.data;
+            const history = historyResult.data || {};
             const outputs = {};
 
             // 处理输出结果
@@ -288,45 +570,61 @@ export class ComfyUINode {
               if (nodeOutput.images) {
                 const images = [];
                 for (const imageInfo of nodeOutput.images) {
-                  if (imageInfo.type === 'output') {
-                    const imageResult = await this.getImage(
-                      imageInfo.filename,
-                      imageInfo.subfolder,
-                      imageInfo.type
-                    );
+                  const type = imageInfo.type || 'output';
+                  const imageResult = await this.getImage(
+                    imageInfo.filename,
+                    imageInfo.subfolder,
+                    type
+                  );
 
-                    if (imageResult.success) {
-                      images.push({
-                        filename: imageInfo.filename,
-                        subfolder: imageInfo.subfolder,
-                        type: imageInfo.type,
-                        buffer: imageResult.buffer,
-                        data: imageResult.data
-                      });
-                    }
+                  if (imageResult.success) {
+                    images.push({
+                      filename: imageInfo.filename,
+                      subfolder: imageInfo.subfolder,
+                      type,
+                      buffer: imageResult.buffer,
+                      data: imageResult.data
+                    });
                   }
                 }
                 outputs[nodeId] = { images };
               }
             }
 
-            this.log('info', '工作流执行完成', { promptId });
+            const status = (history as any)?.status;
+            const historyError = (history as any)?.error
+              || status?.error
+              || status?.detail
+              || status?.message;
+            const nodeErrors = Object.values<any>(history.outputs || {}).flatMap((n: any) => n?.errors || []);
+            const combinedError = historyError || (nodeErrors.length ? nodeErrors.join('\n') : undefined);
+            const success = !combinedError;
+
+            if (!success) {
+              this.log('error', '工作流执行失败', { promptId, error: combinedError });
+            } else {
+              this.log('info', '工作流执行完成', { promptId });
+            }
+
             resolve({
-              success: true,
+              success,
               prompt_id: promptId,
               outputs,
               history,
-              message: 'Execution completed successfully'
+              error: combinedError,
+              message: success ? 'Execution completed successfully' : combinedError
             });
           }
         } catch (err) {
           clearTimeout(timeout);
           this.ws?.off('message', onMessage);
+          this.ws?.off('close', onClose);
           reject(err);
         }
       };
 
       this.ws.on('message', onMessage);
+      this.ws.on('close', onClose);
     });
   }
 
@@ -363,6 +661,59 @@ export class ComfyUINode {
     return modifiedPrompt;
   }
 
+  private _injectPlaceholders(promptJson: any, replacements: PlaceholderDict) {
+    const placeholderKeys = Object.keys(replacements || {});
+    const placeholderRegexes = placeholderKeys.map(key => ({
+      key,
+      pattern: new RegExp(`\\{\\{\\s*${escapeRegExp(key)}\\s*\\}\\}`, 'gi'),
+    }));
+
+    const used = new Set<string>();
+    const promptProvided = typeof replacements?.prompt !== 'undefined' && String(replacements.prompt).length > 0;
+
+    const replace = (value: any): any => {
+      if (typeof value === 'string') {
+        let result = value;
+        for (const { key, pattern } of placeholderRegexes) {
+          if (pattern.test(result)) {
+            used.add(key);
+            const replacement = String(replacements[key] ?? '');
+            result = result.replace(pattern, replacement);
+          }
+        }
+        return result;
+      }
+
+      if (Array.isArray(value)) {
+        return value.map(item => replace(item));
+      }
+
+      if (value && typeof value === 'object') {
+        const cloned: Record<string, any> = {};
+        for (const key of Object.keys(value)) {
+          cloned[key] = replace(value[key]);
+        }
+        return cloned;
+      }
+
+      return value;
+    };
+
+    const replaced = replace(promptJson);
+
+    // 针对 prompt 占位符保持原有提醒（仅当用户确实提供了提示词）
+    if (promptProvided && !used.has('prompt')) {
+      this.log('warn', '工作流中未找到提示词占位符，将使用原始JSON', { placeholder: PROMPT_PLACEHOLDER });
+    }
+
+    const unused = placeholderKeys.filter(k => !used.has(k));
+    if (unused.length) {
+      this.log('debug', '部分占位符未在工作流中使用', { unused });
+    }
+
+    return replaced;
+  }
+
   /**
    * 用户上传JSON格式的prompt文本，执行该prompt工作流
    * 执行后轮询，直到成功后返回服务器的响应值
@@ -370,25 +721,38 @@ export class ComfyUINode {
    * @param {string} userPrompt - 用户输入的prompt
    * @param {Object} options - 执行选项
    * @param {boolean} options.avoidCache - 是否避免缓存，默认true
+   * @param {PlaceholderDict} options.placeholders - 其他占位符替换
    * @returns {Promise<Object>} 执行结果
    */
   async executePromptWorkflow(workflowJson: any, userPrompt: string, options: any = {}) {
-    const { avoidCache = true } = options;
+    const { avoidCache = true, placeholders = {} as PlaceholderDict } = options;
 
     try {
 
-      // 0. 修改prompt
+      // 0) 若目标在 frp 访问密码后面，先换放行
+      await this.ensureAccessAuth();
+
+      // 0.1) 修改prompt
       const newSeedPrompt = this._modifyPromptToAvoidCache(workflowJson, avoidCache);
-      const promptString = JSON.stringify(newSeedPrompt);
-      if (!promptString.includes(PROMPT_PLACEHOLDER)) {
-        this.log('warn', '工作流中未找到提示词占位符，将使用原始JSON', { placeholder: PROMPT_PLACEHOLDER });
+      const finalPrompt = this._injectPlaceholders(newSeedPrompt, { prompt: userPrompt, ...placeholders });
+      // 0.5 轻量健康检查，避免长时间空闲后连接假死
+      try {
+        const health = await this.getQueueStatus();
+        if (!health.success) {
+          this.log('warn', '健康检查失败，可能无法提交工作流', { error: health.error });
+        }
+      } catch (healthError) {
+        this.log('warn', '健康检查异常，继续尝试执行', { error: healthError?.message || healthError });
       }
-      const finalPrompt = JSON.parse(promptString.replaceAll(PROMPT_PLACEHOLDER, userPrompt))
       // 1. 建立WebSocket连接
+      this.log('debug', '准备建立 WebSocket 连接', { endpoint: this.serverEndpoint, secure: this.isSecureConnection });
       await this.connect();
+      this.log('debug', 'WebSocket 连接已就绪', { clientId: this.clientId });
       // 2. 提交prompt到队列
+      this.log('debug', '提交工作流到队列', { hasPrompt: !!userPrompt, placeholderKeys: Object.keys(placeholders || {}) });
       const queueResult = await this.queuePrompt(finalPrompt);
       if (!queueResult.success) {
+        this.log('error', '提交工作流到队列失败', { error: queueResult.error || queueResult.message });
         await this.disconnect();
         return queueResult;
       }
@@ -398,6 +762,7 @@ export class ComfyUINode {
       const executionResult = await this.waitForCompletion(queueResult.prompt_id);
 
       // 4. 断开连接
+      this.log('debug', '准备断开 WebSocket 连接', { clientId: this.clientId });
       await this.disconnect();
 
       return executionResult;
@@ -421,12 +786,12 @@ export class ComfyUINode {
    */
   async interrupt() {
     try {
-      const response = await this.ctx.http.post(`${this.isSecureConnection ? 'https' : 'http'}://${this.serverEndpoint}/interrupt`, null, {
+      const response = await this.withRetry<any>('中断执行', () => this.ctx.http.post(`${this.isSecureConnection ? 'https' : 'http'}://${this.serverEndpoint}/interrupt`, null, {
         headers: {
           'Accept': 'application/json',
           'Content-Type': 'application/json'
         }
-      });
+      }));
 
       this.log('warn', '中断执行成功');
       return {
@@ -450,7 +815,7 @@ export class ComfyUINode {
    */
   async getQueueStatus() {
     try {
-      const response = await this.ctx.http.get(`${this.isSecureConnection ? 'https' : 'http'}://${this.serverEndpoint}/queue`);
+      const response = await this.withRetry<any>('获取队列状态', () => this.ctx.http.get(`${this.isSecureConnection ? 'https' : 'http'}://${this.serverEndpoint}/queue`));
 
       this.log('debug', '获取队列状态成功');
       return {

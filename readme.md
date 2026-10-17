@@ -1,83 +1,104 @@
-# koishi-plugin-comfyui-client
+# koishi-plugin-comfyclient
 
-[![npm](https://img.shields.io/npm/v/koishi-plugin-comfyui-client?style=flat-square)](https://www.npmjs.com/package/koishi-plugin-comfyui-client)
-[![GitHub](https://img.shields.io/github/stars/flymyd/koishi-plugin-comfyui-client?style=flat-square)](https://github.com/flymyd/koishi-plugin-comfyui-client)
+一个为 [Koishi](https://koishi.chat/) 设计的 [ComfyUI](https://github.com/comfyanonymous/ComfyUI) 客户端插件：把任意 ComfyUI 工作流接到 QQ 等聊天平台上，用户用一条 `comfy` 指令就能出图。
 
-一个为 [Koishi](https://koishi.chat/) 设计的 [ComfyUI](https://github.com/comfyanonymous/ComfyUI) 客户端插件。它允许你通过 Koishi 机器人执行任何 ComfyUI 工作流，实现文生图等功能。
+本仓库基于 [flymyd/koishi-plugin-comfyui-client](https://github.com/flymyd/koishi-plugin-comfyui-client) 继续开发。
 
-## ✨ 功能特性
+## 功能
 
-- **高度可定制**: 支持通过 JSON 加载任意 ComfyUI 工作流。
-- **文生图指令**: 提供 `comfy` 指令，方便用户通过文本生成图片。
-- **LLM 提示词增强**: 可选集成 OpenAI 兼容的 LLM (如 GPT、Gemini、Kimi) 来优化用户的输入提示词，生成更丰富、更具表现力的图像。
-- **安全过滤**: 内置 SFW (Safe for Work) 模式，当使用 LLM 增强时，可自动过滤不当内容。
-- **动态连接**: 自动处理与 ComfyUI 服务器的 WebSocket 连接和 HTTP 请求。
+- **任意工作流**：工作流以 JSON 存进配置（预设）或 `workflowDir` 下的文件，按名字用 `-w` 选择。
+- **占位符**：`{{prompt}}`、`{{image}}`、`{{ratio}}`、`{{steps}}`、`{{vars 里的任意键}}`。
+- **比例/尺寸**：`-r 3:4`、`--width`、`--height`，按原工作流面积换算出对齐 64 的宽高，写入所有带 `width/height` 的节点（`EmptyLatentImage`、`EmptyFlux2LatentImage` 等）。
+- **模型切换**：`-m sft` 之类，通过 `modelAliases` 映射到具体 `unet_name`；未命中别名则把原文当文件名。
+- **步数覆盖**：`-s 30` 直接改写带数值型 `steps` 的节点。
+- **图生图**：消息里附图或用 `-i <url>`，配合工作流里的 `{{image}}` 占位符；默认把图片内联成 base64，也可走 `/upload/image`。
+- **frp 隧道友好**：支持 SakuraFrp 等「访问密码」表单认证，以及自动 HTTPS 的自签证书（跳过校验）。
+- **LLM 提示词增强**：可选，接 OpenAI 兼容接口。
 
-## 💿 安装
+## 安装
 
-在 Koishi 插件市场搜索 `comfyui-client` 并安装。
+在 Koishi 插件市场搜索 `comfyclient`，或：
 
-## ⚙️ 配置项
+```bash
+yarn add koishi-plugin-comfyclient
+```
 
-在 Koishi 的插件配置页面填入以下选项：
+## 指令
 
-| 配置项 | 类型 | 默认值 | 描述 |
+```
+comfy <提示词> [-w 工作流] [-m 模型] [-r 比例] [-s 步数] [-i 图片] [--width N] [--height N] [--vars JSON] [--list]
+```
+
+示例：
+
+```
+comfy 雨夜霓虹街道上回头的少女 -w moss
+comfy 雨夜霓虹街道上回头的少女 -w moss -m base -r 3:4 -s 50
+comfy 换成水彩风格 -w relit -i https://example.com/a.png
+comfy --list
+```
+
+选项也可以写在提示词后面（`comfy 提示词 -w moss -m base`）。
+
+## 配置
+
+| 配置项 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `serverEndpoint` | `string` | `127.0.0.1:8188` | ComfyUI 服务器地址，格式为 `域名/IP:端口`。 |
-| `isSecureConnection` | `boolean` | `false` | 是否使用 `https` 和 `wss` 进行安全连接。 |
-| `picOutputNodeID` | `string` | `9` | 在工作流中，最终输出图像的节点 (通常是 `SaveImage` 节点) 的 ID。 |
-| `workflowJSON` | `string` (文本域) | (空) | 你的 ComfyUI 工作流的 JSON 字符串。**这是插件的核心配置**。 |
-| `LLMSettings` | `object` | - | (可选) LLM 增强设置。 |
-| `LLMSettings.enabled` | `boolean` | `false` | 是否启用 LLM 来增强用户输入的提示词。 |
-| `LLMSettings.endpoint` | `string` | `https://api.z.ai/api/paas/v4` | OpenAI 兼容的 LLM API 地址。 |
-| `LLMSettings.model` | `string` | `glm-4.5-flash` | LLM 模型 ID。 |
-| `LLMSettings.key` | `string` | `sk-******` | 你的 LLM API Key。 |
-| `LLMSettings.prompt` | `string` (文本域) | (内置提示词) | 用于指导 LLM 生成图像提示词的系统提示 (System Prompt)。 |
-| `LLMSettings.isSFW` | `boolean` | `true` | 是否启用安全模式，过滤 R18 内容。 |
+| `serverEndpoint` | string | `127.0.0.1:8188` | ComfyUI 地址，`域名/IP:端口`，不要带协议 |
+| `isSecureConnection` | boolean | false | 用 `https`/`wss` 连接（frp 自动 HTTPS 时必须开） |
+| `accessPassword` | string | 空 | frp（如 SakuraFrp）隧道访问密码；插件会自己过认证页 |
+| `allowInsecureTLS` | boolean | false | 跳过证书校验（frp 自签证书场景），WebSocket 同步生效 |
+| `httpProxy` | string | 空 | 请求走指定代理，留空跟随环境变量 |
+| `imageUploadMode` | `base64-first` / `image-first` | base64-first | 图生图的图片传输方式 |
+| `uploadTimeoutMs` / `uploadMaxAttempts` | number | 15000 / 1 | 上传超时与重试 |
+| `workflowDir` | string | `data/comfyworkflow` | 工作流文件目录（相对 Koishi 工作目录） |
+| `defaultWorkflowName` | string | 空 | 不传 `-w` 时用哪个预设/文件；空则用 `workflowJSON` |
+| `workflowPresets` | array | `[]` | 预设列表：`{name, description, content}`，`content` 是工作流 JSON 文本 |
+| `workflowJSON` | textarea | 空 | 内联工作流（兜底） |
+| `modelAliases` | array | `[]` | `{name, unet}`：`-m name` → `unet_name` |
+| `logEnabled` / `debug` | boolean | true / false | 日志等级 |
 
----
+### 工作流要求
 
-### 如何获取 `workflowJSON` 和 `picOutputNodeID`
+1. 正面提示词节点的 `text` 写成 `{{prompt}}`。
+2. 需要图生图时，把图片占位符 `{{image}}` 放进对应节点（`LoadImage.image` 或自定义 base64 节点的输入）。
+3. 宽高节点保持数值（比例换算靠它算面积），步数节点保持数值（`-s` 靠它覆盖）。
+4. 输出节点用 `SaveImage` / `ImagePreview`，插件会自动找。
 
-为了让插件知道如何执行你的工作流，你需要从 ComfyUI 导出它。
+### 模型别名 + 预设示例（MOSS Image）
 
-1.  **在 ComfyUI 中构建你的工作流**。
-    -   确保你的工作流中有一个接收正面提示词的 `CLIPTextEncode` 节点。
-    -   将该节点的 `text` 输入框内容设置为一个独特的占位符：`114514.1919810`。插件会自动将用户的输入替换到这里。
-    -   记下最终生成图像的 `SaveImage` 节点的 ID。你可以在节点标题上看到这个数字。
+```yaml
+modelAliases:
+  - { name: sft,  unet: moss_image_sft_int8_convrot.safetensors }
+  - { name: base, unet: moss-image-base-dit-int8-convrot.safetensors }
 
-2.  **导出工作流**。
-    -   点击 ComfyUI 界面右侧的 `Save (API Format)` 按钮。
-    -   这会导出一个 JSON 文件。
-
-3.  **填入配置**。
-    -   用文本编辑器打开刚刚下载的 JSON 文件，**复制所有内容**。
-    -   将复制的内容粘贴到插件配置的 `workflowJSON` 文本框中。
-    -   将在步骤 1 中记下的 `SaveImage` 节点 ID (例如 `9`) 填入 `picOutputNodeID` 字段。
-
-## 🚀 使用方法
-
-配置完成后，你可以通过以下指令使用插件：
-
+workflowPresets:
+  - name: moss
+    description: MOSS Image 原生，默认 1024 / 25 步
+    content: |
+      {
+        "1": { "class_type": "UNETLoader", "inputs": { "unet_name": "moss_image_sft_int8_convrot.safetensors", "weight_dtype": "default" } },
+        "2": { "class_type": "CLIPLoader", "inputs": { "clip_name": "moss-image-qwen35-int8-convrot-native.safetensors", "type": "moss_image", "device": "default" } },
+        "3": { "class_type": "VAELoader", "inputs": { "vae_name": "MOSS-Image-INT8\\flux2-vae.safetensors" } },
+        "4": { "class_type": "CLIPTextEncode", "inputs": { "text": "{{prompt}}", "clip": ["2", 0] } },
+        "5": { "class_type": "CLIPTextEncode", "inputs": { "text": "", "clip": ["2", 0] } },
+        "6": { "class_type": "EmptyFlux2LatentImage", "inputs": { "width": 1024, "height": 1024, "batch_size": 1 } },
+        "11": { "class_type": "SkipLayerGuidanceDiTSimple", "inputs": { "model": ["1", 0], "double_layers": "", "single_layers": "22", "start_percent": 0, "end_percent": 1 } },
+        "7": { "class_type": "KSampler", "inputs": { "seed": 20261018, "steps": 25, "cfg": 3, "sampler_name": "euler", "scheduler": "sgm_uniform", "denoise": 1, "model": ["11", 0], "positive": ["4", 0], "negative": ["5", 0], "latent_image": ["6", 0] } },
+        "8": { "class_type": "VAEDecode", "inputs": { "samples": ["7", 0], "vae": ["3", 0] } },
+        "9": { "class_type": "SaveImage", "inputs": { "images": ["8", 0], "filename_prefix": "moss_bot" } }
+      }
 ```
-comfy <你的提示词>
+
+MOSS Image 用原生链路即可：采样倍率由模型自带的 shift 5 / multiplier 1 处理，**不要**再串 `ModelSamplingSD3`（默认 multiplier 1000 会出噪点图）；TE 需要键名为 `model.language_model.*` 的 `-native` 版本。
+
+## 构建
+
+```bash
+yarn install
+yarn build     # tsc -p tsconfig.json -> lib/
 ```
 
-**示例:**
+## 许可
 
-```
-comfy a cute cat sitting on a sofa
-```
-
-如果开启了 LLM 增强，插件会首先将你的提示词发送给 LLM 进行优化，然后再提交给 ComfyUI 生成图像。
-
-## 📄 许可协议
-
-本项目使用 [MIT](./LICENSE) 许可协议。
-
-## ❤️ 作者
-
-**koishi-plugin-comfyui-client** © [flymyd](https://github.com/flymyd), Released under the MIT License.
-Authored and maintained by flymyd.
-
-> GitHub [@flymyd](https://github.com/flymyd) · 夏雪冬花
+MIT。原始版本 © [flymyd](https://github.com/flymyd)。
