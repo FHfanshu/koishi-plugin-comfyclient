@@ -598,6 +598,21 @@ export function apply(ctx: Context, config: Config) {
     pluginLogger?.error?.("创建图片缓存目录失败", { dir: IMAGE_CACHE_DIR, error: err?.message || err });
   });
 
+  // 排查「指令没反应」用：debug 打开时把每条消息的会话坐标打出来
+  ctx.middleware((session: any, next: any) => {
+    if (DEBUG_ENABLED) {
+      log("debug", "收到消息", {
+        platform: session.platform,
+        selfId: session.selfId,
+        guildId: session.guildId,
+        channelId: session.channelId,
+        userId: session.userId,
+        content: String(session.content || "").slice(0, 160),
+      });
+    }
+    return next();
+  }, true);
+
   ctx
     .command("comfy [userPrompt:text] ComfyUI绘图/改图")
     .option("workflow", "-w <workflow:string> 指定工作流名（可为预设或文件名）")
