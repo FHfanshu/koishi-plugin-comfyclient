@@ -10,11 +10,18 @@ export interface WorkflowPreset {
   name: string;
   description?: string;
   content: string;
+  /** 工作流 JSON 在 ComfyUI 服务器 user 目录下的相对路径；非空时优先从服务器拉取 */
+  remotePath: string;
 }
 
 export interface ModelAlias {
   name: string;
   unet: string;
+}
+
+export interface LoraAlias {
+  name: string;
+  lora: string;
 }
 
 export interface Config {
@@ -33,6 +40,11 @@ export interface Config {
    * 未命中别名时把 `-m` 的原文直接写进 unet_name。
    */
   modelAliases: ModelAlias[];
+  /**
+   * LoRA 别名表：Bot 用户用 `-l asian` 时映射到具体 LoRA 文件名。
+   * 未命中别名时把 `-l` 的原文直接写进 lora_name；不带 `-l` 时工作流里的 LoRA 节点会被摘掉。
+   */
+  loraAliases: LoraAlias[];
   workflowJSON: string;
   /**
    * 图片上传方式：
@@ -82,15 +94,44 @@ async function readWorkflow(dir: string, name: string) {
   return content;
 }
 
-function resolveWorkflowText(ctxConfig: Config, optionsWorkflow: string | undefined, logger: any, workflowDirAbs: string): WorkflowResolveResult {
+async function resolveWorkflowText(
+  ctxConfig: Config,
+  optionsWorkflow: string | undefined,
+  logger: any,
+  workflowDirAbs: string,
+  comfyNode: ComfyUINode
+): Promise<WorkflowResolveResult> {
   const desiredName = optionsWorkflow || ctxConfig.defaultWorkflowName;
+  const preset = desiredName ? ctxConfig.workflowPresets?.find((p) => p.name === desiredName) : undefined;
 
-  if (desiredName) {
-    const preset = ctxConfig.workflowPresets?.find((p) => p.name === desiredName);
-    if (preset) {
-      logger?.info?.("使用工作流预设", { desiredName, source: "preset" });
+  // 1) 预设指向服务器路径：优先从推理机拉取，避免把 JSON 正文放在 koishi.yml
+  const remotePath = preset?.remotePath?.trim();
+  if (preset && remotePath) {
+    try {
+      const text = await comfyNode.fetchUserData(remotePath);
+      logger?.info?.("使用服务器工作流", { desiredName, source: `server:${remotePath}` });
+      return { text, source: `server:${remotePath}`, name: desiredName, preset };
+    } catch (err) {
+      if (!preset.content?.trim()) {
+        logger?.error?.("读取服务器工作流失败，预设没有可回退的 content", {
+          desiredName,
+          remotePath,
+          error: (err as any)?.message,
+        });
+        throw new Error(`读取服务器工作流失败（${remotePath}）：${(err as any)?.message || err}`);
+      }
+      logger?.warn?.("读取服务器工作流失败，回退预设 content", {
+        desiredName,
+        remotePath,
+        error: (err as any)?.message,
+      });
       return { text: preset.content, source: "preset", name: desiredName, preset };
     }
+  }
+
+  if (preset?.content?.trim()) {
+    logger?.info?.("使用工作流预设", { desiredName, source: "preset" });
+    return { text: preset.content, source: "preset", name: desiredName, preset };
   }
 
   if (desiredName) {
@@ -234,6 +275,40 @@ function applyModelOverride(promptJson: any, modelRaw: string | undefined, alias
   return clone;
 }
 
+const LORA_CLASS = "LoraLoaderModelOnly";
+
+/**
+ * 工作流里带一个 `LoraLoaderModelOnly` 节点承载 `-l`：带了就填名字，没带就把节点摘掉、
+ * 把它的下游 model 引用接回上游，避免空 lora_name 触发 ComfyUI 的 value_not_in_list。
+ */
+function applyLoraOverride(promptJson: any, loraRaw: string | undefined, aliases: LoraAlias[] | undefined, logger?: any) {
+  const clone = JSON.parse(JSON.stringify(promptJson));
+  const loraNodeId = Object.keys(clone).find((id) => clone[id]?.class_type === LORA_CLASS);
+  if (!loraNodeId) return clone;
+
+  const wanted = (loraRaw || "").trim();
+  if (!wanted) {
+    const upstream = clone[loraNodeId].inputs?.model;
+    if (!Array.isArray(upstream)) return clone;
+    for (const node of Object.values<any>(clone)) {
+      const inputs = (node as any)?.inputs;
+      if (!inputs || typeof inputs !== "object") continue;
+      for (const [key, value] of Object.entries<any>(inputs)) {
+        if (Array.isArray(value) && value[0] === loraNodeId) inputs[key] = upstream;
+      }
+    }
+    delete clone[loraNodeId];
+    logger?.debug?.("未指定 LoRA，已跳过 LoRA 节点");
+    return clone;
+  }
+
+  const alias = (aliases || []).find((item) => item.name?.toLowerCase() === wanted.toLowerCase());
+  const loraName = alias?.lora || wanted;
+  clone[loraNodeId].inputs.lora_name = loraName;
+  logger?.info?.("已应用 LoRA", { requested: wanted, resolvedAlias: alias?.name || null, loraName });
+  return clone;
+}
+
 function workflowExpectsPureBase64(promptJson: any) {
   const placeholderPattern = /\{\{\s*image\s*\}\}/i;
   const scanInputs = (inputs: any) => {
@@ -302,7 +377,7 @@ function recoverInlineOptions(rawPrompt: string | undefined, parsedOptions: any)
   const recovered: Record<string, any> = {};
 
   type Rule = {
-    key: keyof Config | "workflow" | "image" | "ratio" | "steps" | "vars" | "list" | "width" | "height" | "model";
+    key: keyof Config | "workflow" | "image" | "ratio" | "steps" | "vars" | "list" | "width" | "height" | "model" | "noexpand" | "lora";
     regex: RegExp;
     value?: any;
   };
@@ -311,6 +386,8 @@ function recoverInlineOptions(rawPrompt: string | undefined, parsedOptions: any)
     { key: "workflow", regex: /(?:^|\s)-w\s+([^\s]+)/i },
     { key: "model", regex: /(?:^|\s)--model\s+([^\s]+)/i },
     { key: "model", regex: /(?:^|\s)-m\s+([^\s]+)/i },
+    { key: "lora", regex: /(?:^|\s)--lora\s+([^\s]+)/i },
+    { key: "lora", regex: /(?:^|\s)-l\s+([^\s]+)/i },
     { key: "ratio", regex: /(?:^|\s)-r\s+([0-9]+:[0-9]+)/i },
     { key: "steps", regex: /(?:^|\s)-s\s+([0-9]+)/i },
     { key: "width", regex: /(?:^|\s)--width\s+([0-9]+)/i },
@@ -318,6 +395,8 @@ function recoverInlineOptions(rawPrompt: string | undefined, parsedOptions: any)
     { key: "vars", regex: /(?:^|\s)--vars\s+(\{.*?\})(?=\s|$)/i },
     { key: "image", regex: /(?:^|\s)-i\s+([^\s]+)/i },
     { key: "list", regex: /(?:^|\s)--list(?=\s|$)/i, value: true },
+    { key: "noexpand", regex: /(?:^|\s)--noexpand(?=\s|$)/i, value: true },
+    { key: "noexpand", regex: /(?:^|\s)-n(?=\s|$)/i, value: true },
   ];
 
   for (const rule of rules) {
@@ -530,7 +609,8 @@ export const Config: Schema<Config> = Schema.object({
     Schema.object({
       name: Schema.string().description("工作流名称"),
       description: Schema.string().default("").description("说明（可选）"),
-      content: Schema.string().role("textarea").description(`工作流 JSON 内容，含 ${PROMPT_PLACEHOLDER} 等占位符`),
+      content: Schema.string().role("textarea").default("").description(`工作流 JSON 内容，含 ${PROMPT_PLACEHOLDER} 等占位符；配置了 remotePath 时可留空`),
+      remotePath: Schema.string().default("").description("工作流 JSON 在 ComfyUI 服务器 user 目录下的相对路径（如 bot_workflows/moss_expand.json）。设置后优先从服务器拉取，content 可留空。"),
     })
   )
     .default([])
@@ -543,6 +623,14 @@ export const Config: Schema<Config> = Schema.object({
   )
     .default([])
     .description("模型别名表：`-m sft` 之类映射到具体 unet 文件名；未命中则把原文当文件名"),
+  loraAliases: Schema.array(
+    Schema.object({
+      name: Schema.string().description("别名（Bot 用户用 -l 传入）"),
+      lora: Schema.string().description("实际 LoRA 文件名"),
+    })
+  )
+    .default([])
+    .description("LoRA 别名表：`-l asian` 之类映射到具体 LoRA 文件名；未命中则把原文当文件名，不带 -l 时工作流里的 LoRA 节点会被摘掉"),
   workflowJSON: Schema.string()
     .role("textarea")
     .default("")
@@ -598,8 +686,21 @@ export function apply(ctx: Context, config: Config) {
     pluginLogger?.error?.("创建图片缓存目录失败", { dir: IMAGE_CACHE_DIR, error: err?.message || err });
   });
 
+  // 指令识别前清理粘连：`comfy【…`（缺空格或夹了零宽字符）会让 Koishi 认不出指令名
+  const normalizeCommandGap = (session: any) => {
+    const raw = String(session.content || "");
+    let fixed = raw.replace(/[\u200b-\u200f\ufeff]/g, "").replace(/\u3000/g, " ");
+    fixed = fixed.replace(/^(comfy)(?=[^\s])/i, "$1 ");
+    if (fixed === raw) return false;
+    const extras = (session.elements || []).filter((el: any) => el.type !== "text");
+    session.content = fixed;
+    if (extras.length) session.elements = [...(session.elements || []), ...extras];
+    return true;
+  };
+
   // 排查「指令没反应」用：debug 打开时把每条消息的会话坐标打出来
   ctx.middleware((session: any, next: any) => {
+    const repaired = normalizeCommandGap(session);
     if (DEBUG_ENABLED) {
       log("debug", "收到消息", {
         platform: session.platform,
@@ -607,6 +708,7 @@ export function apply(ctx: Context, config: Config) {
         guildId: session.guildId,
         channelId: session.channelId,
         userId: session.userId,
+        repaired,
         content: String(session.content || "").slice(0, 160),
       });
     }
@@ -616,7 +718,9 @@ export function apply(ctx: Context, config: Config) {
   ctx
     .command("comfy [userPrompt:text] ComfyUI绘图/改图")
     .option("workflow", "-w <workflow:string> 指定工作流名（可为预设或文件名）")
+    .option("noexpand", "-n 跳过提示词扩写，直接使用 mossraw 预设")
     .option("model", "-m <model:string> 指定模型（别名如 sft/base，或直接给 unet 文件名）")
+    .option("lora", "-l <lora:string> 叠加 LoRA（别名如 asian，或直接给文件名）；不带则跳过工作流里的 LoRA 节点")
     .option("ratio", "-r <ratio:string> 指定输出比例，占位符 {{ratio}} 可在工作流中使用")
     .option("vars", "--vars <json:string> 以 JSON 提供额外占位符，如 {\"ratio\":\"16:9\",\"style\":\"film\"}")
     .option("width", "--width <width:number> 指定输出宽度（优先级高于比例）")
@@ -661,7 +765,7 @@ export function apply(ctx: Context, config: Config) {
           return `工作流预设：${presetNames}\n工作流文件：${fileNames}`;
         }
 
-        const workflowResolve = resolveWorkflowText(config, mergedOptions?.workflow, pluginLogger, WORKFLOW_DIR);
+        const workflowResolve = await resolveWorkflowText(config, mergedOptions?.noexpand ? "mossraw" : mergedOptions?.workflow, pluginLogger, WORKFLOW_DIR, comfyNode);
         const workflowText = workflowResolve.text;
         const promptJson = JSON.parse(workflowText);
         const hasPromptPlaceholder = workflowText.includes(PROMPT_PLACEHOLDER);
@@ -686,6 +790,7 @@ export function apply(ctx: Context, config: Config) {
           typeof mergedOptions?.steps === "number" ? mergedOptions.steps : undefined,
           pluginLogger
         );
+        const promptWithLora = applyLoraOverride(promptWithOverrides, mergedOptions?.lora, config.loraAliases, pluginLogger);
 
         log("info", "开始执行工作流", { server: COMFYUI_SERVER, secure: IS_SECURE_CONNECTION });
         const extraPlaceholders: Record<string, any> = {};
@@ -767,7 +872,7 @@ export function apply(ctx: Context, config: Config) {
           return "请提供提示词或图片中的任意一种输入";
         }
 
-        const result: any = await comfyNode.executePromptWorkflow(promptWithOverrides, finalUserPrompt, { placeholders: extraPlaceholders });
+        const result: any = await comfyNode.executePromptWorkflow(promptWithLora, finalUserPrompt, { placeholders: extraPlaceholders });
         if (result.success) {
           const picked = pickOutputNode(result.outputs || {}, promptJson, pluginLogger);
           if (!picked) {

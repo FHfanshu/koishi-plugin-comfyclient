@@ -78,6 +78,19 @@ export class ComfyUINode {
     }
   }
 
+  private resolveProxy() {
+    // 1) 配置优先
+    const fromConfig = this.parseProxy(this.httpProxy?.trim());
+    if (fromConfig) return { proxy: fromConfig, source: 'config' };
+
+    // 2) 环境变量兜底（优先 http_proxy/https_proxy，其次 all_proxy）
+    const envCandidate = this.envProxySnapshot.http_proxy || this.envProxySnapshot.https_proxy || this.envProxySnapshot.all_proxy;
+    const fromEnv = this.parseProxy(envCandidate);
+    if (fromEnv) return { proxy: fromEnv, source: 'env' };
+
+    return { proxy: undefined, source: 'direct' }; // 无代理
+  }
+
   private isRetryableError(error: any) {
     const status = error?.response?.status;
     const code = error?.code || error?.cause?.code;
@@ -167,19 +180,6 @@ export class ComfyUINode {
         return formData;
       };
 
-      const resolveProxy = () => {
-        // 1) 配置优先
-        const fromConfig = this.parseProxy(this.httpProxy?.trim());
-        if (fromConfig) return { proxy: fromConfig, source: 'config' };
-
-        // 2) 环境变量兜底（优先 http_proxy/https_proxy，其次 all_proxy）
-        const envCandidate = this.envProxySnapshot.http_proxy || this.envProxySnapshot.https_proxy || this.envProxySnapshot.all_proxy;
-        const fromEnv = this.parseProxy(envCandidate);
-        if (fromEnv) return { proxy: fromEnv, source: 'env' };
-
-        return { proxy: undefined, source: 'direct' }; // 无代理
-      };
-
       const sendOnce = async (attempt: number) => {
         const formData = buildForm();
 
@@ -197,7 +197,7 @@ export class ComfyUINode {
 
         const contentLength = await getContentLength();
 
-        const { proxy, source: proxySource } = resolveProxy();
+        const { proxy, source: proxySource } = this.resolveProxy();
         this.log('debug', '开始上传图片到 ComfyUI', {
           attempt,
           filename,
@@ -293,6 +293,47 @@ export class ComfyUINode {
     } catch (error) {
       this.log('warn', '提交 frp 访问密码失败', { error: (error as any)?.message || error });
     }
+  }
+
+  /**
+   * 读取 ComfyUI 用户目录下的文件（GET /userdata/<相对路径>）。
+   * 工作流放在推理机的 user/default/bot_workflows/ 下时，Koishi 侧只需记住相对路径。
+   * @param {string} relPath - 相对 user 目录的路径，如 bot_workflows/moss_expand.json
+   * @returns {Promise<string>} 文件文本内容
+   */
+  async fetchUserData(relPath: string): Promise<string> {
+    const rel = String(relPath || '').trim().replace(/^\/+/, '');
+    if (!rel) throw new Error('remotePath 不能为空');
+
+    await this.ensureAccessAuth();
+
+    const url = `${this.isSecureConnection ? 'https' : 'http'}://${this.serverEndpoint}/userdata/${encodeURIComponent(rel)}`;
+    const { proxy, source: proxySource } = this.resolveProxy();
+    this.log('debug', '从 ComfyUI 用户目录读取文件', {
+      relPath: rel,
+      proxy: proxy ? `${proxy.host}:${proxy.port || ''}` : proxySource,
+    });
+
+    let text: string;
+    try {
+      text = await this.ctx.http.get(url, { responseType: 'text', timeout: 15000, proxy });
+    } catch (error) {
+      const status = (error as any)?.response?.status;
+      const body = (error as any)?.response?.data;
+      const detail = typeof body === 'string' ? body.slice(0, 200) : (error as any)?.message || error;
+      this.log('error', '从 ComfyUI 用户目录读取文件失败', { relPath: rel, status, error: detail });
+      throw new Error(`从 ComfyUI 读取 ${rel} 失败${status ? `（HTTP ${status}）` : ''}：${detail}`);
+    }
+
+    // 没通过 frp 访问密码时，隧道会返回登录页而不是 JSON
+    const head = text.trimStart().slice(0, 200).toLowerCase();
+    if (head.startsWith('<!doctype') || head.startsWith('<html')) {
+      this.log('error', '从 ComfyUI 用户目录读取到 HTML 页面', { relPath: rel });
+      throw new Error(`从 ComfyUI 读取 ${rel} 失败：服务器返回了 HTML 页面，可能是未通过访问密码认证`);
+    }
+
+    this.log('info', '从 ComfyUI 用户目录读取文件成功', { relPath: rel, length: text.length });
+    return text;
   }
 
   async connect(maxAttempts = 3) {
@@ -503,16 +544,110 @@ export class ComfyUINode {
         return;
       }
 
-      const timeout = setTimeout(() => {
+      let settled = false;
+      let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+      const cleanup = () => {
+        clearTimeout(timeout);
+        if (pollTimer) clearInterval(pollTimer);
         this.ws?.off('message', onMessage);
+        this.ws?.off('close', onClose);
+      };
+
+      const timeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
         reject(new Error('Execution timeout'));
       }, 300000); // 5分钟超时
 
       const onClose = () => {
-        clearTimeout(timeout);
-        this.ws?.off('message', onMessage);
-        this.ws?.off('close', onClose);
-        reject(new Error('WebSocket closed before completion'));
+        // 隧道把 WebSocket 断了不代表任务停了，下面轮询历史记录仍能收尾。
+        this.log('warn', 'WebSocket 在执行完成前关闭，继续轮询历史记录', { promptId });
+      };
+
+      const finish = async () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+
+        // 获取执行历史和结果（容错重试，避免写盘延迟导致 outputs 为空）
+        const fetchHistoryWithRetry = async () => {
+          const attempts = 10;
+          const delay = 500;
+          let last: any;
+          for (let i = 1; i <= attempts; i++) {
+            last = await this.getHistory(promptId);
+            const hasOutputs = last?.success && last.data && Object.keys(last.data.outputs || {}).length > 0;
+            if (hasOutputs) {
+              this.log('info', '获取执行历史成功', { attempt: i, promptId });
+              return last;
+            }
+            this.log('debug', '执行历史尚无输出，等待重试', { attempt: i, promptId });
+            if (i < attempts) await this.sleep(delay);
+          }
+          return last;
+        };
+
+        const historyResult = await fetchHistoryWithRetry();
+        if (!historyResult?.success) {
+          reject(new Error('Failed to get execution history'));
+          return;
+        }
+
+        const history = historyResult.data || {};
+        const outputs = {};
+
+        // 处理输出结果
+        for (const nodeId of Object.keys(history.outputs || {})) {
+          const nodeOutput = history.outputs[nodeId];
+          if (nodeOutput.images) {
+            const images = [];
+            for (const imageInfo of nodeOutput.images) {
+              const type = imageInfo.type || 'output';
+              const imageResult = await this.getImage(
+                imageInfo.filename,
+                imageInfo.subfolder,
+                type
+              );
+
+              if (imageResult.success) {
+                images.push({
+                  filename: imageInfo.filename,
+                  subfolder: imageInfo.subfolder,
+                  type,
+                  buffer: imageResult.buffer,
+                  data: imageResult.data
+                });
+              }
+            }
+            outputs[nodeId] = { images };
+          }
+        }
+
+        const status = (history as any)?.status;
+        const historyError = (history as any)?.error
+          || status?.error
+          || status?.detail
+          || status?.message;
+        const nodeErrors = Object.values<any>(history.outputs || {}).flatMap((n: any) => n?.errors || []);
+        const combinedError = historyError || (nodeErrors.length ? nodeErrors.join('\n') : undefined);
+        const success = !combinedError;
+
+        if (!success) {
+          this.log('error', '工作流执行失败', { promptId, error: combinedError });
+        } else {
+          this.log('info', '工作流执行完成', { promptId });
+        }
+
+        resolve({
+          success,
+          prompt_id: promptId,
+          outputs,
+          history,
+          error: combinedError,
+          message: success ? 'Execution completed successfully' : combinedError
+        });
       };
 
       const onMessage = async (data: RawData, isBinary: boolean) => {
@@ -529,105 +664,37 @@ export class ComfyUINode {
           const messageData = message.data;
 
           // 检查是否是我们等待的prompt完成消息
-            if (message.type === 'executing' &&
-              messageData.prompt_id === promptId &&
-              messageData.node === null) {
-
-            clearTimeout(timeout);
-            this.ws?.off('message', onMessage);
-            this.ws?.off('close', onClose);
-
-            // 获取执行历史和结果（容错重试，避免写盘延迟导致 outputs 为空）
-            const fetchHistoryWithRetry = async () => {
-              const attempts = 10;
-              const delay = 500;
-              let last: any;
-              for (let i = 1; i <= attempts; i++) {
-                last = await this.getHistory(promptId);
-                const hasOutputs = last?.success && last.data && Object.keys(last.data.outputs || {}).length > 0;
-                if (hasOutputs) {
-                  this.log('info', '获取执行历史成功', { attempt: i, promptId });
-                  return last;
-                }
-                this.log('debug', '执行历史尚无输出，等待重试', { attempt: i, promptId });
-                if (i < attempts) await this.sleep(delay);
-              }
-              return last;
-            };
-
-            const historyResult = await fetchHistoryWithRetry();
-            if (!historyResult?.success) {
-              reject(new Error('Failed to get execution history'));
-              return;
-            }
-
-            const history = historyResult.data || {};
-            const outputs = {};
-
-            // 处理输出结果
-            for (const nodeId of Object.keys(history.outputs || {})) {
-              const nodeOutput = history.outputs[nodeId];
-              if (nodeOutput.images) {
-                const images = [];
-                for (const imageInfo of nodeOutput.images) {
-                  const type = imageInfo.type || 'output';
-                  const imageResult = await this.getImage(
-                    imageInfo.filename,
-                    imageInfo.subfolder,
-                    type
-                  );
-
-                  if (imageResult.success) {
-                    images.push({
-                      filename: imageInfo.filename,
-                      subfolder: imageInfo.subfolder,
-                      type,
-                      buffer: imageResult.buffer,
-                      data: imageResult.data
-                    });
-                  }
-                }
-                outputs[nodeId] = { images };
-              }
-            }
-
-            const status = (history as any)?.status;
-            const historyError = (history as any)?.error
-              || status?.error
-              || status?.detail
-              || status?.message;
-            const nodeErrors = Object.values<any>(history.outputs || {}).flatMap((n: any) => n?.errors || []);
-            const combinedError = historyError || (nodeErrors.length ? nodeErrors.join('\n') : undefined);
-            const success = !combinedError;
-
-            if (!success) {
-              this.log('error', '工作流执行失败', { promptId, error: combinedError });
-            } else {
-              this.log('info', '工作流执行完成', { promptId });
-            }
-
-            resolve({
-              success,
-              prompt_id: promptId,
-              outputs,
-              history,
-              error: combinedError,
-              message: success ? 'Execution completed successfully' : combinedError
-            });
+          if (message.type === 'executing' &&
+            messageData.prompt_id === promptId &&
+            messageData.node === null) {
+            await finish();
           }
         } catch (err) {
-          clearTimeout(timeout);
-          this.ws?.off('message', onMessage);
-          this.ws?.off('close', onClose);
+          if (settled) return;
+          settled = true;
+          cleanup();
           reject(err);
         }
       };
+
+      // 完成消息经长隧道可能丢失，历史轮询作为兜底，谁先到谁收尾。
+      pollTimer = setInterval(async () => {
+        if (settled) return;
+        try {
+          const history = await this.getHistory(promptId);
+          if (history?.success && history.data && Object.keys(history.data.outputs || {}).length > 0) {
+            this.log('info', '轮询到执行结果，WebSocket 完成消息可能丢失', { promptId });
+            await finish();
+          }
+        } catch {
+          // 单次轮询失败不算失败，交给总超时。
+        }
+      }, 3000);
 
       this.ws.on('message', onMessage);
       this.ws.on('close', onClose);
     });
   }
-
   /**
    * 避免缓存：修改prompt中的随机参数
    * @param {Object} promptJson - 原始prompt
