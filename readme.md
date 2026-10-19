@@ -80,7 +80,7 @@ loraAliases:
   - { name: asian, lora: moss-maleAsian_3305665_comfy.safetensors }
   - { name: acid,  lora: newacid_r32_e30_comfy.safetensors }
   - { name: sys,   lora: newacid_r32_e30_comfy.safetensors }
-  - { name: xiuran, lora: 'character-ocs\3in1\xiuranmoqing-moss-step1050.safetensors' }   # 子目录要写全名，Windows 用反斜杠
+  - { name: doc,   lora: 'character-ocs\3in1\xiuranmoqing-moss-step1050.safetensors' }   # 子目录要写全名，Windows 用反斜杠
 
 workflowPresets:
   - name: moss
