@@ -382,21 +382,23 @@ function recoverInlineOptions(rawPrompt: string | undefined, parsedOptions: any)
     value?: any;
   };
   const rules: Rule[] = [
-    { key: "workflow", regex: /(?:^|\s)--workflow\s+([^\s]+)/i },
-    { key: "workflow", regex: /(?:^|\s)-w\s+([^\s]+)/i },
-    { key: "model", regex: /(?:^|\s)--model\s+([^\s]+)/i },
-    { key: "model", regex: /(?:^|\s)-m\s+([^\s]+)/i },
-    { key: "lora", regex: /(?:^|\s)--lora\s+([^\s]+)/i },
-    { key: "lora", regex: /(?:^|\s)-l\s+([^\s]+)/i },
-    { key: "ratio", regex: /(?:^|\s)-r\s+([0-9]+:[0-9]+)/i },
-    { key: "steps", regex: /(?:^|\s)-s\s+([0-9]+)/i },
-    { key: "width", regex: /(?:^|\s)--width\s+([0-9]+)/i },
-    { key: "height", regex: /(?:^|\s)--height\s+([0-9]+)/i },
-    { key: "vars", regex: /(?:^|\s)--vars\s+(\{.*?\})(?=\s|$)/i },
-    { key: "image", regex: /(?:^|\s)-i\s+([^\s]+)/i },
-    { key: "list", regex: /(?:^|\s)--list(?=\s|$)/i, value: true },
-    { key: "noexpand", regex: /(?:^|\s)--noexpand(?=\s|$)/i, value: true },
-    { key: "noexpand", regex: /(?:^|\s)-n(?=\s|$)/i, value: true },
+    // 选项前面常常直接跟中文（`正对镜头。-l doc`），所以只要求前一个字符不是字母/数字/短横线，
+    // 而不是像以前那样必须是行首或空白。
+    { key: "workflow", regex: /(?<![\w-])--workflow\s+([^\s]+)/i },
+    { key: "workflow", regex: /(?<![\w-])-w\s+([^\s]+)/i },
+    { key: "model", regex: /(?<![\w-])--model\s+([^\s]+)/i },
+    { key: "model", regex: /(?<![\w-])-m\s+([^\s]+)/i },
+    { key: "lora", regex: /(?<![\w-])--lora\s+([^\s]+)/i },
+    { key: "lora", regex: /(?<![\w-])-l\s+([^\s]+)/i },
+    { key: "ratio", regex: /(?<![\w-])-r\s+([0-9]+:[0-9]+)/i },
+    { key: "steps", regex: /(?<![\w-])-s\s+([0-9]+)/i },
+    { key: "width", regex: /(?<![\w-])--width\s+([0-9]+)/i },
+    { key: "height", regex: /(?<![\w-])--height\s+([0-9]+)/i },
+    { key: "vars", regex: /(?<![\w-])--vars\s+(\{.*?\})(?=\s|$)/i },
+    { key: "image", regex: /(?<![\w-])-i\s+([^\s]+)/i },
+    { key: "list", regex: /(?<![\w-])--list(?=\s|$)/i, value: true },
+    { key: "noexpand", regex: /(?<![\w-])--noexpand(?=\s|$)/i, value: true },
+    { key: "noexpand", regex: /(?<![\w-])-n(?=\s|$)/i, value: true },
   ];
 
   for (const rule of rules) {
